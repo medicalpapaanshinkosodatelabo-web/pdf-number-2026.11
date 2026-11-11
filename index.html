@@ -183,6 +183,15 @@
     <h2><span class="step">2</span>番号の設定</h2>
     <div class="fields">
       <div class="field">
+        <label for="mode">番号の入れ方</label>
+        <select id="mode">
+          <option value="text">文字として入れる（今までの形・軽い）</option>
+          <option value="burn">画像に焼き込む（NotebookLM用）</option>
+        </select>
+        <div class="hint" id="modeHint">NotebookLM に入れる本（スクショのPDF）は「画像に焼き込む」を選んでください。文字として入れると、NotebookLM が本文を読めなくなることがあります。焼き込みは保存に時間がかかります（数百ページで数分）。</div>
+      </div>
+
+      <div class="field">
         <span class="lbl">番号の場所（紙の上をタップ）</span>
         <div class="pos" id="pos">
           <button type="button" data-v="top-left">左上</button><button type="button" data-v="top-center">中央上</button><button type="button" data-v="top-right">右上</button>
@@ -284,6 +293,7 @@
     const fmt = $("format").value === "custom" ? $("custom").value : $("format").value;
     const onPos = document.querySelector("#pos button.on");
     return {
+      mode: $("mode").value,
       position: onPos ? onPos.dataset.v : "bottom-center",
       format: fmt || "{n}",
       startPage: Math.max(1, parseInt($("startPage").value, 10) || 1),
@@ -329,6 +339,105 @@
       page.drawText(text, { x: box.x + x, y: box.y + y, size: o.size, font, color, rotate: degrees(r) });
     });
     return { bytes: await doc.save(), pageCount: pages.length, numbered };
+  }
+
+  // ---- 焼き込み（NotebookLM用）：ページを絵にして、番号を絵の一部として描く ----
+  // 文字のデータを持たないPDFになるので、NotebookLM が本文も番号も絵から読み取れる
+  const CANVAS_FONTS = {
+    Helvetica: "Helvetica, Arial, sans-serif",
+    HelveticaBold: "bold Helvetica, Arial, sans-serif",
+    TimesRoman: "'Times New Roman', Times, serif",
+    Courier: "'Courier New', Courier, monospace"
+  };
+  const BURN_HEIGHT = 2000; // 絵にするときの高さ（px）
+  function canvasFont(o, px){
+    const f = CANVAS_FONTS[o.font] || CANVAS_FONTS.Helvetica;
+    return f.startsWith("bold ") ? `bold ${px}px ${f.slice(5)}` : `${px}px ${f}`;
+  }
+  function isLight(hex){
+    const n = parseInt(hex.replace("#",""), 16);
+    return (0.299*((n>>16)&255) + 0.587*((n>>8)&255) + 0.114*(n&255)) > 140;
+  }
+  function loadPdfjs(bytes){
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+    return pdfjsLib.getDocument({ data: bytes.slice() }).promise;
+  }
+  // 1ページを絵にして番号を描く。戻り値は canvas と、元のページの大きさ（pt）
+  async function burnPage(pdf, i, o, total, height){
+    const page = await pdf.getPage(i);
+    const base = page.getViewport({ scale: 1 });
+    const scale = height / base.height;
+    const vp = page.getViewport({ scale });
+    const cv = document.createElement("canvas");
+    cv.width = Math.round(vp.width); cv.height = Math.round(vp.height);
+    const ctx = cv.getContext("2d");
+    ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, cv.width, cv.height);
+    await page.render({ canvasContext: ctx, viewport: vp, intent: "print" }).promise;
+    if (i >= o.startPage){
+      const text = label(o.format, o.startNum + (i - o.startPage), total);
+      // NotebookLM が読める大きさにするため、ページの高さの 1/40 より小さくしない
+      const px = Math.max(o.size * scale, cv.height / 40), m = o.margin * MM * scale;
+      const [vert, horiz] = o.position.split("-");
+      ctx.font = canvasFont(o, px);
+      ctx.textBaseline = vert === "top" ? "top" : "bottom";
+      ctx.textAlign = horiz === "left" ? "left" : horiz === "right" ? "right" : "center";
+      const x = horiz === "left" ? m : horiz === "right" ? cv.width - m : cv.width / 2;
+      const y = vert === "top" ? m : cv.height - m;
+      // 白い紙でも黒い紙でも見えるように、文字のまわりに反対の色のふちをつける
+      ctx.lineJoin = "round";
+      ctx.lineWidth = Math.max(2, px / 6);
+      ctx.strokeStyle = isLight(o.color) ? "#000000" : "#ffffff";
+      ctx.strokeText(text, x, y);
+      ctx.fillStyle = o.color;
+      ctx.fillText(text, x, y);
+    }
+    page.cleanup();
+    return { cv, w: base.width, h: base.height };
+  }
+  function canvasToJpeg(cv){
+    return new Promise((ok, ng) => cv.toBlob(b => b ? b.arrayBuffer().then(ok, ng) : ng(new Error("絵にできませんでした")), "image/jpeg", 0.85));
+  }
+  async function burnPdf(bytes, o, onProgress){
+    if (!window.pdfjsLib) throw new Error("焼き込みの部品を読み込めませんでした。電波のある所で開き直してください");
+    const pdf = await loadPdfjs(bytes);
+    const out = await PDFDocument.create();
+    const n = pdf.numPages;
+    const numbered = Math.max(0, n - (o.startPage - 1));
+    const total = o.startNum + numbered - 1;
+    for (let i = 1; i <= n; i++){
+      const { cv, w, h } = await burnPage(pdf, i, o, total, BURN_HEIGHT);
+      const jpg = await out.embedJpg(await canvasToJpeg(cv));
+      cv.width = cv.height = 0; // iPhone のメモリを空ける
+      out.addPage([w, h]).drawImage(jpg, { x: 0, y: 0, width: w, height: h });
+      if (onProgress) onProgress(i, n);
+    }
+    pdf.destroy();
+    return { bytes: await out.save(), pageCount: n, numbered };
+  }
+  // 焼き込みの見本（最初の数ページだけ絵にして並べる）
+  async function renderBurnPreview(bytes, o){
+    const token = ++previewToken;
+    const strip = $("strip");
+    const pdf = await loadPdfjs(bytes);
+    if (token !== previewToken){ pdf.destroy(); return 0; }
+    const n = Math.min(pdf.numPages, MAX_PREVIEW);
+    const numbered = Math.max(0, pdf.numPages - (o.startPage - 1));
+    const total = o.startNum + numbered - 1;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const frag = document.createDocumentFragment();
+    for (let i = 1; i <= n; i++){
+      const { cv } = await burnPage(pdf, i, o, total, 200 * dpr);
+      if (token !== previewToken){ pdf.destroy(); return 0; }
+      const fig = document.createElement("figure");
+      const cap = document.createElement("figcaption");
+      cap.textContent = i + "ページ目";
+      fig.append(cv, cap); frag.append(fig);
+    }
+    strip.replaceChildren(frag);
+    $("more").textContent = pdf.numPages > n ? `見本は最初の${n}ページだけです（全${pdf.numPages}ページ）。保存するときに全ページを焼き込みます。` : "";
+    const count = pdf.numPages;
+    pdf.destroy();
+    return { pageCount: count, numbered };
   }
 
   // ---- 見本をかく（iPhoneでも全ページ見えるように、絵にして並べる）----
@@ -382,7 +491,19 @@
     if (busy){ again = true; return; }
     busy = true; $("save").disabled = true; setMsg("作っています…");
     try{
-      const res = await stampPdf(srcBytes, readOpts());
+      const opts = readOpts();
+      if (opts.mode === "burn"){
+        outBytes = null;
+        const res = await renderBurnPreview(srcBytes, opts);
+        if (res){
+          $("save").disabled = res.numbered === 0;
+          setMsg(res.numbered > 0
+            ? `全${res.pageCount}ページ中、${res.numbered}ページに番号を焼き込みます。保存を押すと作り始めます`
+            : "番号をつけるページがありません。「何ページ目から」を見直してください", res.numbered === 0);
+        }
+        return;
+      }
+      const res = await stampPdf(srcBytes, opts);
       outBytes = res.bytes;
       $("save").disabled = res.numbered === 0;
       setMsg(res.numbered > 0
@@ -429,15 +550,30 @@
     $("custom").hidden = !c; $("customHint").hidden = !c;
     schedule();
   });
-  ["custom","startPage","startNum","size","margin","font","color"].forEach(id => {
+  ["mode","custom","startPage","startNum","size","margin","font","color"].forEach(id => {
     $(id).addEventListener("input", schedule);
     $(id).addEventListener("change", schedule);
   });
 
   $("save").addEventListener("click", async () => {
+    const opts = readOpts();
+    if (opts.mode === "burn"){
+      if (!srcBytes || busy) return;
+      busy = true; $("save").disabled = true;
+      try{
+        const res = await burnPdf(srcBytes, opts, (i, n) => setMsg(`焼き込んでいます… ${i} / ${n} ページ`));
+        outBytes = res.bytes;
+      }catch(e){
+        outBytes = null;
+        setMsg("うまく焼き込めませんでした：" + String(e && e.message || e), true);
+        return;
+      }finally{
+        busy = false; $("save").disabled = false;
+      }
+    }
     if (!outBytes) return;
     const dl = downloads || await downloadsReady;
-    const filename = srcName + "_ページ番号付き.pdf";
+    const filename = srcName + (opts.mode === "burn" ? "_番号焼き込み.pdf" : "_ページ番号付き.pdf");
     const blob = new Blob([outBytes], { type: "application/pdf" });
     if (!dl){
       // Claudeの外（GitHubやファイルで開いたとき）は、普通のダウンロード
